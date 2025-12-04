@@ -24,10 +24,10 @@ These equations include the internal torques from the reaction wheels and gyrosc
 """
 import numpy as np
 import ppigrf # can calculate Earth's magnetic field for the magnetic torque function.
-
+print("hi")
 ## Constants of the satellite
 m = 20.1 # mass (kg)
-cg = np.array([-0.51, 1.25, 2.02]) # center of gravity from geometric center (cm)
+cg = 0.01 * np.array([-0.51, 1.35, 2.02]) # center of gravity from geometric center (m)
 inertia = np.diag([0.540, 0.518, 0.357]) # moment of inertia tensor (kg*m^2)
 r_altitude = 400e3 # altitude (m)
 r_earth = 6370e3 # radius of the Earth (m)
@@ -35,8 +35,9 @@ r_total = r_earth + r_altitude # total radius from center of the Earth (m)
 mu_earth = 3.986e14 # gravitational parameter of the Earth (m^3/s^2)
 raan = np.deg2rad(45) # right ascension of ascending node (degrees to radians)
 inclination = np.deg2rad(51.6) # inclination of orbit (degrees to radians)
-dimensions = np.array([67.89, 22.63, 32.65]) # dimensions of the satellite (cm)
+dimensions = 0.01 * np.array([67.89, 22.63, 32.65]) # dimensions of the satellite (m)
 dipole_moment = np.array([0.2, 0.2, 0.2]) # magnetic dipole moment (A*m^2)
+
 
 ## Quaternion math functions
 def quaternion_mult(q1, q2):
@@ -98,7 +99,7 @@ torque_history = {
     "aero": [],
     "srp": [],
     "total": []
-} # for data collection
+} # for data collection and plotting
 
 def gravity_gradient_torque(mu_earth, r_i, q, inertia): # r_i is position in inertial frame
     rnorm = np.linalg.norm(r_i)
@@ -155,7 +156,7 @@ def orbit_r_v_calculation(t): # inputs a time, and outputs the position and velo
     v_i = v_raan @ v_inclination @ v_orbit
     return r_i, v_i
 
-def magnetic_field(r_i):
+def magnetic_field(r_i): # Simplfied magnetic field: https://en.wikipedia.org/wiki/Magnetic_dipole
     rnorm = np.linalg.norm(r_i)
     rhat = r_i / rnorm
     mu0 = 4 * np.pi * 1e-7
@@ -167,7 +168,7 @@ def magnetic_field(r_i):
         np.cos(dipole_tilt)
     ])
 
-    B = (mu0 * M_earth/ (4 * np.pi * rnorm**3)) * (3 * (mhat.dot(rhat)*rhat - mhat))
+    B = (mu0 * M_earth/ (4 * np.pi * rnorm**3)) * ((3 * (mhat.dot(rhat))*rhat) - mhat)
     return B
 
 def state_vector_equation(t, y):
@@ -185,7 +186,7 @@ def state_vector_equation(t, y):
     torque_total = torque_mag + torque_grav + torque_drag + torque_srp
 
     torque_history["time"].append(t)
-    torque_history["aero"].append(torque_grav.copy())
+    torque_history["aero"].append(torque_drag.copy())
     torque_history["gravity_gradient"].append(torque_grav.copy())
     torque_history["magnetic"].append(torque_mag.copy())
     torque_history["srp"].append(torque_srp.copy())
@@ -219,20 +220,31 @@ def rk4_integrator(func, t, y, dt):
 
 ## Example Values
 t_start = 0.0
-t_end = 600.0
+t_end = 6000.0
 dt = 0.1
 y = state_initial.copy()
 
 t = t_start
 history = []
 times = []
+pos_history = []
+vel_history = []
+
 while t < t_end:
     y = rk4_integrator(state_vector_equation, t, y, dt)
     t += dt
     history.append(y.copy())
     times.append(t)
+
+    # Save position and velocity
+    r_i, v_i = orbit_r_v_calculation(t)
+    pos_history.append(r_i.copy())
+    vel_history.append(v_i.copy())
+
 history = np.array(history)
 times = np.array(times)
+pos_history = np.array(pos_history)
+vel_history = np.array(vel_history)
 
 for key in ["gravity_gradient", "magnetic", "aero", "srp", "total"]:
     torque_history[key] = np.array(torque_history[key])
@@ -263,4 +275,25 @@ plt.ylabel("Torque (Nm)")
 plt.legend()
 plt.grid(True)
 
+# Position Components
+plt.figure()
+plt.plot(times, pos_history[:,0], label="Position X")
+plt.plot(times, pos_history[:,1], label="Position Y")
+plt.plot(times, pos_history[:,2], label="Position Z")
+plt.title("Position Components")
+plt.xlabel("Time (s)")
+plt.ylabel("Position (m)")
+plt.legend()
+plt.grid(True)
+
+# Velocity Components
+plt.figure()
+plt.plot(times, vel_history[:,0], label="Velocity X")
+plt.plot(times, vel_history[:,1], label="Velocity Y")
+plt.plot(times, vel_history[:,2], label="Velocity Z")
+plt.title("Velocity Components")
+plt.xlabel("Time (s)")
+plt.ylabel("Velocity (m/s)")
+plt.legend()
+plt.grid(True)
 plt.show()
