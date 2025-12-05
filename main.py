@@ -21,10 +21,21 @@ T(wheels) = f(q(err), g(err), w(err). T(wheels) is the control torque from the r
 
 These equations include the internal torques from the reaction wheels and gyroscopic effects from the wheels for higher precision.
     
+
+    Controls Equations
+E(wheels) = 0.5 * m(wheels) * r(wheels)^2 * [e1 e2 e3] for each direction e the wheel faces: E is like an inertia tensor vector for wheels.
+torque(wheels) = -kp * q(err) - ki * g(err) - kd * w(err), simplfies when split into diagonal matrix form (see pg.21 of first link)
+g(err) is the time weighted sum of q(err), g(err) (t) = integral from 0 to t of q(err) (t') * e ^ (t' - t / t0) dt'
+I(tot) * Wdot(b) = -E(wheels) * sdot + torque(ext) - w(b) x (I(tot) @ w(b)) - w(b) x (E(wheels) @ s)
+wmax(wheels) = 0.5 * m(wheels) * r(wheels)^2 / I(min) - approximates the wheels angular velocity
+
+    Gain Determination
+Use a set of differential equations to derive optimal gains instead of manual tunings.
+Approximate the system as a linear system about equillibrium and use te Jacobian Matrix
+
 """
 import numpy as np
 import ppigrf # can calculate Earth's magnetic field for the magnetic torque function.
-print("hi")
 ## Constants of the satellite
 m = 20.1 # mass (kg)
 cg = 0.01 * np.array([-0.51, 1.35, 2.02]) # center of gravity from geometric center (m)
@@ -250,6 +261,7 @@ for key in ["gravity_gradient", "magnetic", "aero", "srp", "total"]:
     torque_history[key] = np.array(torque_history[key])
 torque_history["time"] = np.array(torque_history["time"])
 
+""""" Annotated for now, can change to see plots when needed.
 # plotting results
 import matplotlib.pyplot as plt
 time = torque_history["time"]
@@ -297,3 +309,4 @@ plt.ylabel("Velocity (m/s)")
 plt.legend()
 plt.grid(True)
 plt.show()
+"""
