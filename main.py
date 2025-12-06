@@ -460,6 +460,5 @@ plt.ylabel("Velocity (m/s)")
 plt.legend()
 plt.grid(True)
 """
-print("hi")
 plt.tight_layout()
 plt.show()
