@@ -22,7 +22,7 @@ T(wheels) = f(q(err), g(err), w(err). T(wheels) is the control torque from the r
 These equations include the internal torques from the reaction wheels and gyroscopic effects from the wheels for higher precision.
     
 
-    Controls Equations
+    Controls Equations: Section 6 of https://arxiv.org/pdf/2408.00176
 E(wheels) = 0.5 * m(wheels) * r(wheels)^2 * [e1 e2 e3] for each direction e the wheel faces: E is like an inertia tensor vector for wheels.
 torque(wheels) = -kp * q(err) - ki * g(err) - kd * w(err), simplfies when split into diagonal matrix form (see pg.21 of first link)
 g(err) is the time weighted sum of q(err), g(err) (t) = integral from 0 to t of q(err) (t') * e ^ (t' - t / t0) dt'
@@ -36,12 +36,13 @@ Approximate the system as a linear system about equillibrium and use te Jacobian
 """
 import numpy as np
 import ppigrf # can calculate Earth's magnetic field for the magnetic torque function.
+
 ## Constants of the satellite
 m = 20.1 # mass (kg)
 cg = 0.01 * np.array([-0.51, 1.35, 2.02]) # center of gravity from geometric center (m)
 inertia = np.diag([0.540, 0.518, 0.357]) # moment of inertia tensor (kg*m^2)
 r_altitude = 400e3 # altitude (m)
-r_earth = 6370e3 # radius of the Earth (m)
+r_earth = 6371e3 # radius of the Earth (m)
 r_total = r_earth + r_altitude # total radius from center of the Earth (m)
 mu_earth = 3.986e14 # gravitational parameter of the Earth (m^3/s^2)
 raan = np.deg2rad(45) # right ascension of ascending node (degrees to radians)
@@ -49,6 +50,45 @@ inclination = np.deg2rad(51.6) # inclination of orbit (degrees to radians)
 dimensions = 0.01 * np.array([67.89, 22.63, 32.65]) # dimensions of the satellite (m)
 dipole_moment = np.array([0.2, 0.2, 0.2]) # magnetic dipole moment (A*m^2)
 
+## Control Law Constants
+dt_control = 0.1 # time step (s)
+t0_integ = 10 # scaling factor (s) - how much time it takes for the controller to forget past errors (i.e errors from 10 seconds ago are forgotten)
+g_err = np.array([0.0, 0.0, 0.0]) # time weighted quaternion error
+q_target = np.array([1, 0, 0, 0]) # target quaternion (can be changed based on pointing requirements)
+rho = 0.1 # gain scale
+
+## from page 26 of https://arxiv.org/pdf/2408.00176, gain matrices are found
+Ix, Iy, Iz = inertia[0,0], inertia[1,1], inertia[2,2]
+kd = np.array([
+    rho * ((3 * Ix / dt_control) - (Ix/t0_integ)),
+    rho * ((3 * Iy / dt_control) - (Iy/t0_integ)),
+    rho * ((3 * Iz / dt_control) - (Iz/t0_integ))
+])
+
+kp = np.array([
+    2 * ((Ix**2) - Ix*kd[0]*t0_integ + (kd[0]**2)*(t0_integ**2)) / (3 * Ix * t0_integ**2),
+    2 * ((Iy**2) - Iy*kd[1]*t0_integ + (kd[1]**2)*(t0_integ**2)) / (3 * Iy * t0_integ**2),
+    2 * ((Iz**2) - Iz*kd[2]*t0_integ + (kd[2]**2)*(t0_integ**2)) / (3 * Iz * t0_integ**2)
+])
+
+ki = np.array([
+    (2 * (kd[0]*t0_integ - 2*Ix)**3) / (27 * (Ix**2) * (t0_integ**3)),
+    (2 * (kd[1]*t0_integ - 2*Iy)**3) / (27 * (Iy**2) * (t0_integ**3)),
+    (2 * (kd[2]*t0_integ - 2*Iz)**3) / (27 * (Iz**2) * (t0_integ**3))
+])
+
+
+## Reaction Wheel Constants
+m_wheel = 0.2 # mass (kg)
+r_wheel = 0.05 # radius (m)
+I_wheel = 0.5 * m_wheel * (r_wheel**2) # inertia (kg * m^2)
+E_wheel = I_wheel * np.eye(3) # inertia matrix (3x3 diagonal matrix)
+s_wheel = np.array([0.0, 0.0, 0.0]) # initial wheel speed (m/s)
+smax_wheel = 3000 * (2 * np.pi/60) # max wheel speed (3000 rpm to rad/s)
+omega_max_x = (I_wheel/Ix) * smax_wheel
+omega_max_y = (I_wheel/Iy) * smax_wheel
+omega_max_z = (I_wheel/Iz) * smax_wheel
+omega_max_vec = np.array([omega_max_x, omega_max_y, omega_max_z])
 
 ## Quaternion math functions
 def quaternion_mult(q1, q2):
@@ -101,6 +141,48 @@ def omega_matrix(omega):
         [wz, wy, -wx, 0]
     ])
     return omega_M
+
+## Control Law Functions
+
+def quaternion_error(q_current, q_target):
+    # q_err = q_target * q_current^-1
+    q_err = quaternion_mult(q_target, quaternion_inv(q_current))
+    q_err = quaternion_norm(q_err)
+    return q_err
+
+def update_time_weighted_sum_error(q_err_vec, g_err, dt, t0):
+    g_err_new = q_err_vec + g_err - (dt/t0) * g_err
+    return g_err_new
+
+def target_omega(q_err, omega_max_vec):
+    theta = 2 * np.arccos(np.clip(q_err[0], -1, 1)) # find the theta angle using the quaternion definition of half angles, makes sure that it is between -1 and 1
+    half_theta = theta/2
+    if abs(np.sin(half_theta)) < 1e-10:
+        return np.zeros(3) # avoid dividing by 0 later
+    n_hat = q_err[1:4] / np.sin(half_theta) # error axis
+
+    theta_max_vec = omega_max_vec * dt_control
+
+    omega_max = np.min(omega_max_vec / (np.abs(n_hat) + 1e-10))
+    theta_max = omega_max * dt_control
+    if theta_max > 0:
+        scale = min(theta/theta_max, 1.0)
+    else:
+        scale = 0
+    omega_target = scale * omega_max * n_hat
+    return omega_target
+
+def PID(q_current, omega_current, q_target, g_err, omega_max_vec):
+    q_err = quaternion_error(q_current, q_target)
+    q_err_vector = q_err[1:4]
+
+    g_err_new = update_time_weighted_sum_error(q_err_vector, g_err, dt_control, t0_integ)
+
+    omega_target = target_omega(q_err, omega_max_vec)
+
+    omega_err = omega_current - omega_target
+    torque_wheels = -(kp * q_err_vector) - (ki * g_err_new) - (kd*omega_err)
+    return torque_wheels, g_err_new
 ## External Torques
 
 torque_history = { 
@@ -109,6 +191,8 @@ torque_history = {
     "magnetic": [],
     "aero": [],
     "srp": [],
+    "wheels": [],
+    "pointing_error": [],
     "total": []
 } # for data collection and plotting
 
@@ -182,9 +266,10 @@ def magnetic_field(r_i): # Simplfied magnetic field: https://en.wikipedia.org/wi
     B = (mu0 * M_earth/ (4 * np.pi * rnorm**3)) * ((3 * (mhat.dot(rhat))*rhat) - mhat)
     return B
 
-def state_vector_equation(t, y):
+def state_vector_equation(t, y, last_control, g_err_state):
     q = y[0:4]
     omega = y[4:7]
+    s = y[7:10]
     q = quaternion_norm(q)
 
     r_i, v_i = orbit_r_v_calculation(t)
@@ -196,53 +281,76 @@ def state_vector_equation(t, y):
 
     torque_total = torque_mag + torque_grav + torque_drag + torque_srp
 
+    torque_wheels = np.zeros(3)
+    s_dot = np.zeros(3)
+    g_err_new = g_err_state
+
+    if t - last_control >= dt_control:
+        torque_wheels, g_err_new = PID(q, omega, q_target, g_err_state, omega_max_vec)
+        s_dot = np.linalg.inv(E_wheel) @ torque_wheels
+        last_control = t
+    
+    I_tot = inertia + E_wheel
+
+    omega_mat = omega_matrix(omega)
+
+    q_dot = 0.5 * omega_mat.dot(q)
+    omega_dot = np.linalg.inv(I_tot) @ (torque_total - np.cross(omega, (I_tot @ omega)) - E_wheel @ s_dot - np.cross(omega, E_wheel @ s))
+
+    q_err = quaternion_error(q, q_target)
+    pointing_error = 2 * np.arccos(np.clip(q_err[0], -1, 1)) * (180/np.pi)
+
+    dydt = np.zeros(10) # create the change in state vector
+    dydt[0:4] = q_dot
+    dydt[4:7] = omega_dot
+    dydt[7:10] = s_dot
+
     torque_history["time"].append(t)
     torque_history["aero"].append(torque_drag.copy())
     torque_history["gravity_gradient"].append(torque_grav.copy())
     torque_history["magnetic"].append(torque_mag.copy())
     torque_history["srp"].append(torque_srp.copy())
+    torque_history["wheels"].append(torque_wheels.copy())
+    torque_history["pointing_error"].append(pointing_error)
     torque_history["total"].append(torque_total.copy())
 
-    omega_mat = omega_matrix(omega)
+    return dydt, last_control, g_err_new
 
-    q_dot = 0.5 * omega_mat.dot(q)
-    omega_dot = np.linalg.inv(inertia) @ (torque_total - np.cross(omega, (inertia @ omega)))
-
-    dydt = np.zeros(7) # create the change in state vector
-    dydt[0:4] = q_dot
-    dydt[4:7] = omega_dot
-    return dydt
-
-q_initial = np.array([1, 0, 0, 0])
-omega_initial = np.array([0, 0, 0.01])
-
-state_initial = np.concatenate([q_initial, omega_initial])
-
-def rk4_integrator(func, t, y, dt):
-    k1 = func(t, y)
-    k2 = func(t + dt/2.0, y + dt/2.0 * k1)
-    k3 = func(t + dt/2.0, y + dt/2.0 * k2)
-    k4 = func(t + dt,     y + dt * k3)
+def rk4_integrator(func, t, y, dt, last_control, g_err_state):
+    k1, lct1,  g1 = func(t, y, last_control, g_err_state)
+    k2, lct2, g2 = func(t + dt/2.0, y + dt/2.0 * k1, lct1, g1)
+    k3, lct3, g3 = func(t + dt/2.0, y + dt/2.0 * k2, lct2, g2)
+    k4, lct4, g4 = func(t + dt,     y + dt * k3, lct3, g3)
 
     y_next = y + dt/6.0 * (k1 + 2*k2 + 2*k3 + k4)
     q_next = quaternion_norm(y_next[0:4])
     y_next[0:4] = q_next
-    return y_next
+    return y_next, lct4, g4 # last control time, and g_err
 
 ## Example Values
+
+q_initial = np.array([0.9, 0.1, 0.1, 0.1])
+q_initial = quaternion_norm(q_initial)
+omega_initial = np.array([0, 0, 0.01])
 t_start = 0.0
-t_end = 6000.0
+t_end = 600.0
 dt = 0.1
+s_initial = np.array([0.0, 0.0, 0.0])
+state_initial = np.concatenate([q_initial, omega_initial, s_initial])
+
 y = state_initial.copy()
 
 t = t_start
+last_control = 0.0
+g_err_state = g_err.copy()
+
 history = []
 times = []
 pos_history = []
 vel_history = []
 
 while t < t_end:
-    y = rk4_integrator(state_vector_equation, t, y, dt)
+    y, last_control, g_err_state = rk4_integrator(state_vector_equation, t, y, dt, last_control, g_err_state)
     t += dt
     history.append(y.copy())
     times.append(t)
@@ -257,13 +365,34 @@ times = np.array(times)
 pos_history = np.array(pos_history)
 vel_history = np.array(vel_history)
 
-for key in ["gravity_gradient", "magnetic", "aero", "srp", "total"]:
+for key in ["gravity_gradient", "magnetic", "aero", "srp", "total", "wheels"]:
     torque_history[key] = np.array(torque_history[key])
 torque_history["time"] = np.array(torque_history["time"])
+torque_history["pointing_error"] = np.array(torque_history["pointing_error"])
+
+
+import matplotlib.pyplot as plt
+# Pointing Error over time
+plt.figure()
+plt.plot(torque_history["time"], torque_history["pointing_error"])
+plt.title("Pointing Error over time")
+plt.xlabel("Time (s)")
+plt.ylabel("Pointing error (degrees)")
+plt.grid(True)
+
+# Wheel Torque Components
+plt.figure()
+plt.plot(torque_history["time"], torque_history["wheels"][:,0], label = "Wheel X")
+plt.plot(torque_history["time"], torque_history["wheels"][:,1], label = "Wheel Y")
+plt.plot(torque_history["time"], torque_history["wheels"][:,2], label = "Wheel Z")
+plt.xlabel("Time (s)")
+plt.ylabel("Reaction Wheel Torques (Nm)")
+plt.grid(True)
+
+
 
 """"" Annotated for now, can change to see plots when needed.
-# plotting results
-import matplotlib.pyplot as plt
+# plotting torques
 time = torque_history["time"]
 # Gravity Gradient Torque components
 plt.figure()
@@ -308,5 +437,6 @@ plt.xlabel("Time (s)")
 plt.ylabel("Velocity (m/s)")
 plt.legend()
 plt.grid(True)
-plt.show()
 """
+print("hi")
+plt.show()
