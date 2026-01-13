@@ -65,7 +65,7 @@ dt_control = 0.1 # time step (s)
 t0_integ = 10 # scaling factor (s) - how much time it takes for the controller to forget past errors (i.e errors from 10 seconds ago are forgotten)
 g_err = np.array([0.0, 0.0, 0.0]) # time weighted quaternion error
 q_target = np.array([1, 0, 0, 0]) # target quaternion (can be changed based on pointing requirements)
-rho = 0.01 # gain scale, the paper used 0.05
+rho = 0.05 # gain scale, the paper used 0.05
 
 ## from page 26 of https://arxiv.org/pdf/2408.00176, gain matrices are found
 Ix, Iy, Iz = inertia[0,0], inertia[1,1], inertia[2,2]
@@ -86,7 +86,6 @@ ki = np.array([
     (2 * (kd[1]*t0_integ - 2*Iy)**3) / (27 * (Iy**2) * (t0_integ**3)),
     (2 * (kd[2]*t0_integ - 2*Iz)**3) / (27 * (Iz**2) * (t0_integ**3))
 ])
-
 
 ## Reaction Wheel Constants
 m_wheel = 0.2 # mass (kg)
@@ -167,40 +166,48 @@ def omega_matrix(omega):
 ## Control Law Functions
 
 def quaternion_error(q_current, q_target):
-    # q_err = q_target * q_current^-1
-    q_err = quaternion_mult(q_target, quaternion_inv(q_current))
+    q_err = quaternion_mult(quaternion_inv(q_target), q_current)
     q_err = quaternion_norm(q_err)
+    
+    if q_err[0] < 0:
+        q_err = -q_err
+    
     return q_err
 
 def update_time_weighted_sum_error(q_err_vec, g_err, dt, t0):
     g_err_new = g_err + (dt * (q_err_vec - g_err) / t0)
     return g_err_new
 
-def target_omega(q_err, omega_max_vec, dt_control):
-    theta = 2 * np.arccos(np.clip(q_err[0], -1, 1)) # find the theta angle using the quaternion definition of half angles, makes sure that it is between -1 and 1
-    half_theta = theta/2
-    if abs(np.sin(half_theta)) < 1e-10:
-        return np.zeros(3) # avoid dividing by 0 later
-    n_hat = q_err[1:4] / np.sin(half_theta) # error axis
-
-    phi = theta*n_hat
-    omega_desired = phi / dt_control
-    omega_target = np.clip(omega_desired, -omega_max_vec, omega_max_vec)
-    return omega_target
-
-def PID(q_current, omega_current, q_target, g_err, omega_max_vec):
+def PID(q_current, omega_current, s_current, q_target, g_err):
     q_err = quaternion_error(q_current, q_target)
-    q_err = quaternion_norm(q_err)
-    q_err_vector = q_err[1:4]
+    q_err_vec = q_err[1:4]
 
-    g_err_new = update_time_weighted_sum_error(q_err_vector, g_err, dt_control, t0_integ)
+    g_err_new = update_time_weighted_sum_error(q_err_vec, g_err, dt_control, t0_integ)
 
-    omega_target = target_omega(q_err, omega_max_vec, dt_control)
+    h_w = E_wheel @ s_current
+    kh = 0.0  # Turn off wheel momentum feedback for now
 
-    omega_err = omega_target - omega_current
-    max_torque = 0.015 # Nm
-    torque_wheels = np.clip((kp * q_err_vector) + (ki * g_err_new) + (kd*omega_err), -max_torque, max_torque)
-    return torque_wheels, g_err_new
+    max_torque = 0.015
+    torque = (
+        kp * q_err_vec
+      + ki * g_err_new
+      + kd * omega_current
+      + kh * h_w
+    )
+
+    # Clip torque to max
+    torque = np.clip(torque, -max_torque, max_torque)
+    
+    # Check if predicted wheel speeds would exceed limits
+    s_dot_predicted = -np.linalg.solve(E_wheel, torque)
+    s_predicted = s_current + s_dot_predicted * dt_control
+    
+    # If any wheel would saturate, reduce ALL torques proportionally
+    for i in range(3):
+        if abs(s_predicted[i]) > smax_wheel * 0.9:  # 90% of max
+            torque[i] = 0.0  # Stop commanding this axis
+    
+    return torque, g_err_new
 ## External Torques
 
 def gravity_gradient_torque(mu_earth, r_i, q, inertia): # r_i is position in inertial frame
@@ -240,7 +247,7 @@ def srp_torque(q, sun_i, r_cp):
     if sun_mag < 1e-10:
         return np.zeros(3)
     
-    sun_b_hat = sun_b / sun_mag
+    sun_b_hat = -sun_b / sun_mag
     A_srp = dimensions[0] * dimensions[1]
     F_srp = P_srp * C_refl * A_srp * sun_b_hat
     T_srp = np.cross(r_cp, F_srp)
@@ -317,6 +324,8 @@ def state_vector_equation(t, y, torque_wheels, s_dot, cp):
 
     r_i, v_i = orbit_r_v_calculation(t)
 
+    """""
+
     torque_mag = magnetic_torque(dipole_moment, magnetic_field(r_i), q)
     torque_grav = gravity_gradient_torque(mu_earth, r_i, q, inertia)
 
@@ -327,16 +336,22 @@ def state_vector_equation(t, y, torque_wheels, s_dot, cp):
         torque_srp = np.zeros(3)
     else:
         torque_srp = srp_torque(q, sun_i, r_cp)
+    
 
     torque_total = torque_mag + torque_grav + torque_drag + torque_srp
+    """
+    torque_total = np.zeros(3)
     
     I_tot = inertia + E_wheel
 
     omega_mat = omega_matrix(omega)
     q_dot = 0.5 * omega_mat.dot(q)
 
-    body_torques = torque_total + torque_wheels - np.cross(omega, (I_tot @ omega)) - np.cross(omega, E_wheel @ s)
-    omega_dot = np.linalg.solve(I_tot, body_torques)
+    body_torques = torque_total - torque_wheels - np.cross(omega, (I_tot @ omega)) - np.cross(omega, E_wheel @ s)
+    h_w = E_wheel @ s
+    omega_dot = np.linalg.solve(inertia, -torque_wheels + torque_total - np.cross(omega, inertia @ omega + h_w))
+    s_dot = np.linalg.solve(E_wheel, -torque_wheels)
+
 
     dydt = np.zeros(10) # create the change in state vector
     dydt[0:4] = q_dot
@@ -359,16 +374,11 @@ def rk4_integrator(func, t, y, dt, torque_wheels, s_dot, cp):
 
 ## Example Values
 
-q_initial = random_quaternion()
-omega_initial = np.random.uniform(-0.05, 0.05, 3)
 t_start = 0.0
-t_end = 3600.0
-dt = 0.1
-s_initial = np.array([0.0, 0.0, 0.0])
-state_initial = np.concatenate([q_initial, omega_initial, s_initial])
+t_end = 100
+dt = 0.01
 
-
-N_mc = 10 # Monte-Carlo simulations
+N_mc = 1 # Monte-Carlo simulations
 max_error_mc = []
 final_error_mc = []
 
@@ -395,6 +405,12 @@ for k in range(N_mc):
     start_sim = time.time()
     print(f"Simulation {k+1}/{N_mc}...", end='', flush=True)
 
+    q_initial = random_quaternion()
+    omega_initial = np.random.uniform(-0.05, 0.05, 3)
+    s_initial = np.array([0.0, 0.0, 0.0])
+    q_initial = np.array([0.996, 0.087, 0, 0])
+    omega_initial = np.zeros(3)
+    state_initial = np.concatenate([q_initial, omega_initial, s_initial])
 
     cp_mc = sample_cp()
     y = state_initial.copy()
@@ -414,13 +430,14 @@ for k in range(N_mc):
         max_error = max(max_error, error)
         
         if t - last_control >= dt_control - 1e-9:
-            torque_wheels, g_err_state = PID(y[0:4], y[4:7], q_target, g_err_state, omega_max_vec)
+            torque_wheels, g_err_state = PID(y[0:4], y[4:7], y[7:10], q_target, g_err_state)
             s_dot = -np.linalg.solve(E_wheel, torque_wheels)
             last_control = t
 
             # Save position and velocity
             if k == N_mc - 1:
                 r_i, v_i = orbit_r_v_calculation(t)
+                """""
                 torque_mag = magnetic_torque(dipole_moment, magnetic_field(r_i), y[0:4])
                 torque_grav = gravity_gradient_torque(mu_earth, r_i, y[0:4], inertia)
                 torque_drag = drag_torque(y[0:4], v_i, cp_mc)
@@ -429,7 +446,11 @@ for k in range(N_mc):
                     torque_srp = np.zeros(3)
                 else:
                     torque_srp = srp_torque(y[0:4], sun_i, cp_mc)
-
+                """""
+                torque_mag = np.zeros(3)
+                torque_grav = np.zeros(3)
+                torque_drag = np.zeros(3)
+                torque_srp = np.zeros(3)
 
                 pointing_error = 2 * np.arccos(np.clip(q_err[0], -1, 1)) * (180 / np.pi)
                 torque_history["time"].append(t)
@@ -537,8 +558,6 @@ axs[1, 0].plot(time, wheel_rpm[:, 2], label='Wheel Z')
 axs[1, 0].axhline(y=3000, color='r', linestyle='--', label='Limit')
 axs[1, 0].set_title("Actual Reaction Wheel Speeds (RPM)")
 axs[1, 0].set_ylabel("RPM")
-
-plt.show()
 
 """"" Annotated for now, can change to see plots when needed.
 # Pointing Error over time
