@@ -88,17 +88,13 @@ ki = np.array([
 ])
 
 ## Reaction Wheel Constants
-m_wheel = 0.2 # mass (kg)
-r_wheel = 0.05 # radius (m)
-I_wheel = 0.5 * m_wheel * (r_wheel**2) # inertia (kg * m^2)
-E_wheel = I_wheel * np.eye(3) # inertia matrix (3x3 diagonal matrix)
+m_wheel = 3 # mass (kg)
+h_max = 0.025 # max momentum storage (Nms)
 s_wheel = np.array([0.0, 0.0, 0.0]) # initial wheel speed (rad/s)
 smax_wheel = 3000 * (2 * np.pi/60) # max wheel speed (3000 rpm to rad/s)
-omega_max_x = (I_wheel/Ix) * smax_wheel
-omega_max_y = (I_wheel/Iy) * smax_wheel
-omega_max_z = (I_wheel/Iz) * smax_wheel
-omega_max_vec = np.array([omega_max_x, omega_max_y, omega_max_z])
-
+I_wheel = h_max / smax_wheel  # Calculate inertia from momentum storage
+r_wheel = np.sqrt(2 * I_wheel / m_wheel)  # Back-calculate radius
+E_wheel = I_wheel * np.eye(3) # inertia matrix (3x3 diagonal matrix)
 def sample_cp():
     delta = np.random.normal(0, cp_mult, size = 3)
     return cp_initial + delta # creates a random center of pressure based on a gaussian normal distribution
@@ -184,15 +180,11 @@ def PID(q_current, omega_current, s_current, q_target, g_err):
 
     g_err_new = update_time_weighted_sum_error(q_err_vec, g_err, dt_control, t0_integ)
 
-    h_w = E_wheel @ s_current
-    kh = 0.0  # Turn off wheel momentum feedback for now
-
-    max_torque = 0.015
+    max_torque = 0.011
     torque = (
         kp * q_err_vec
       + ki * g_err_new
       + kd * omega_current
-      + kh * h_w
     )
 
     # Clip torque to max
@@ -202,10 +194,9 @@ def PID(q_current, omega_current, s_current, q_target, g_err):
     s_dot_predicted = -np.linalg.solve(E_wheel, torque)
     s_predicted = s_current + s_dot_predicted * dt_control
     
-    # If any wheel would saturate, reduce ALL torques proportionally
     for i in range(3):
-        if abs(s_predicted[i]) > smax_wheel * 0.9:  # 90% of max
-            torque[i] = 0.0  # Stop commanding this axis
+        if abs(s_predicted[i]) > smax_wheel * 0.9:
+            torque[i] = 0.0
     
     return torque, g_err_new
 ## External Torques
@@ -324,8 +315,6 @@ def state_vector_equation(t, y, torque_wheels, s_dot, cp):
 
     r_i, v_i = orbit_r_v_calculation(t)
 
-    """""
-
     torque_mag = magnetic_torque(dipole_moment, magnetic_field(r_i), q)
     torque_grav = gravity_gradient_torque(mu_earth, r_i, q, inertia)
 
@@ -339,17 +328,14 @@ def state_vector_equation(t, y, torque_wheels, s_dot, cp):
     
 
     torque_total = torque_mag + torque_grav + torque_drag + torque_srp
-    """
-    torque_total = np.zeros(3)
     
     I_tot = inertia + E_wheel
 
     omega_mat = omega_matrix(omega)
     q_dot = 0.5 * omega_mat.dot(q)
 
-    body_torques = torque_total - torque_wheels - np.cross(omega, (I_tot @ omega)) - np.cross(omega, E_wheel @ s)
     h_w = E_wheel @ s
-    omega_dot = np.linalg.solve(inertia, -torque_wheels + torque_total - np.cross(omega, inertia @ omega + h_w))
+    omega_dot = np.linalg.solve(I_tot, -torque_wheels + torque_total - np.cross(omega, I_tot @ omega) - np.cross(omega, h_w))
     s_dot = np.linalg.solve(E_wheel, -torque_wheels)
 
 
@@ -375,7 +361,7 @@ def rk4_integrator(func, t, y, dt, torque_wheels, s_dot, cp):
 ## Example Values
 
 t_start = 0.0
-t_end = 100
+t_end = 600
 dt = 0.01
 
 N_mc = 1 # Monte-Carlo simulations
@@ -408,8 +394,8 @@ for k in range(N_mc):
     q_initial = random_quaternion()
     omega_initial = np.random.uniform(-0.05, 0.05, 3)
     s_initial = np.array([0.0, 0.0, 0.0])
-    q_initial = np.array([0.996, 0.087, 0, 0])
-    omega_initial = np.zeros(3)
+    q_initial = np.array([0.7071, 0.4082, 0.4082, 0.4082])
+    omega_initial = np.array([0.01, -0.02, 0.015])  # Initial tumble
     state_initial = np.concatenate([q_initial, omega_initial, s_initial])
 
     cp_mc = sample_cp()
@@ -434,10 +420,8 @@ for k in range(N_mc):
             s_dot = -np.linalg.solve(E_wheel, torque_wheels)
             last_control = t
 
-            # Save position and velocity
-            if k == N_mc - 1:
+            if 95 < t < 105 and t - last_control < dt_control:
                 r_i, v_i = orbit_r_v_calculation(t)
-                """""
                 torque_mag = magnetic_torque(dipole_moment, magnetic_field(r_i), y[0:4])
                 torque_grav = gravity_gradient_torque(mu_earth, r_i, y[0:4], inertia)
                 torque_drag = drag_torque(y[0:4], v_i, cp_mc)
@@ -446,11 +430,27 @@ for k in range(N_mc):
                     torque_srp = np.zeros(3)
                 else:
                     torque_srp = srp_torque(y[0:4], sun_i, cp_mc)
-                """""
-                torque_mag = np.zeros(3)
-                torque_grav = np.zeros(3)
-                torque_drag = np.zeros(3)
-                torque_srp = np.zeros(3)
+                torque_total_check = torque_mag + torque_grav + torque_drag + torque_srp
+                L_body = inertia @ y[4:7]  # Should be ~0
+                L_wheels = E_wheel @ y[7:10]  # Should be non-zero
+                L_total = L_body + L_wheels  # Should be roughly constant over time
+                
+                print(f"t={t:.1f}:")
+                print(f"  L_body = {L_body}")
+                print(f"  L_wheels = {L_wheels}")
+                print(f"  L_total = {L_total}")
+
+            # Save position and velocity
+            if k == N_mc - 1:
+                r_i, v_i = orbit_r_v_calculation(t)
+                torque_mag = magnetic_torque(dipole_moment, magnetic_field(r_i), y[0:4])
+                torque_grav = gravity_gradient_torque(mu_earth, r_i, y[0:4], inertia)
+                torque_drag = drag_torque(y[0:4], v_i, cp_mc)
+                sun_i = np.array([1.0, 0.0, 0.0])
+                if shadow(r_i, sun_i):
+                    torque_srp = np.zeros(3)
+                else:
+                    torque_srp = srp_torque(y[0:4], sun_i, cp_mc)
 
                 pointing_error = 2 * np.arccos(np.clip(q_err[0], -1, 1)) * (180 / np.pi)
                 torque_history["time"].append(t)
