@@ -65,7 +65,7 @@ dt_control = 0.1 # time step (s)
 t0_integ = 10 # scaling factor (s) - how much time it takes for the controller to forget past errors (i.e errors from 10 seconds ago are forgotten)
 g_err = np.array([0.0, 0.0, 0.0]) # time weighted quaternion error
 q_target = np.array([1, 0, 0, 0]) # target quaternion (can be changed based on pointing requirements)
-rho = 0.05 # gain scale, the paper used 0.05
+rho = 0.03 # gain scale, the paper used 0.05
 
 ## from page 26 of https://arxiv.org/pdf/2408.00176, gain matrices are found
 Ix, Iy, Iz = inertia[0,0], inertia[1,1], inertia[2,2]
@@ -195,8 +195,10 @@ def PID(q_current, omega_current, s_current, q_target, g_err):
     s_predicted = s_current + s_dot_predicted * dt_control
     
     for i in range(3):
-        if abs(s_predicted[i]) > smax_wheel * 0.9:
-            torque[i] = 0.0
+        if abs(s_predicted[i]) > smax_wheel * 0.95:
+            if s_predicted[i] * s_dot_predicted[i] > 0:
+                torque[i] = 0.0
+    return torque, g_err_new
     
     return torque, g_err_new
 ## External Torques
@@ -364,7 +366,7 @@ t_start = 0.0
 t_end = 600
 dt = 0.01
 
-N_mc = 1 # Monte-Carlo simulations
+N_mc = 5 # Monte-Carlo simulations
 max_error_mc = []
 final_error_mc = []
 
@@ -390,13 +392,14 @@ start_time_total = time.time()
 for k in range(N_mc):
     start_sim = time.time()
     print(f"Simulation {k+1}/{N_mc}...", end='', flush=True)
+    
 
     q_initial = random_quaternion()
-    omega_initial = np.random.uniform(-0.05, 0.05, 3)
+    omega_initial = np.random.uniform(-0.01, 0.01, 3)
     s_initial = np.array([0.0, 0.0, 0.0])
-    q_initial = np.array([0.7071, 0.4082, 0.4082, 0.4082])
-    omega_initial = np.array([0.01, -0.02, 0.015])  # Initial tumble
     state_initial = np.concatenate([q_initial, omega_initial, s_initial])
+    print(f"Initial Quaternion {q_initial}")
+    print(f"Initial Omega {omega_initial}")
 
     cp_mc = sample_cp()
     y = state_initial.copy()
@@ -419,26 +422,6 @@ for k in range(N_mc):
             torque_wheels, g_err_state = PID(y[0:4], y[4:7], y[7:10], q_target, g_err_state)
             s_dot = -np.linalg.solve(E_wheel, torque_wheels)
             last_control = t
-
-            if 95 < t < 105 and t - last_control < dt_control:
-                r_i, v_i = orbit_r_v_calculation(t)
-                torque_mag = magnetic_torque(dipole_moment, magnetic_field(r_i), y[0:4])
-                torque_grav = gravity_gradient_torque(mu_earth, r_i, y[0:4], inertia)
-                torque_drag = drag_torque(y[0:4], v_i, cp_mc)
-                sun_i = np.array([1.0, 0.0, 0.0])
-                if shadow(r_i, sun_i):
-                    torque_srp = np.zeros(3)
-                else:
-                    torque_srp = srp_torque(y[0:4], sun_i, cp_mc)
-                torque_total_check = torque_mag + torque_grav + torque_drag + torque_srp
-                L_body = inertia @ y[4:7]  # Should be ~0
-                L_wheels = E_wheel @ y[7:10]  # Should be non-zero
-                L_total = L_body + L_wheels  # Should be roughly constant over time
-                
-                print(f"t={t:.1f}:")
-                print(f"  L_body = {L_body}")
-                print(f"  L_wheels = {L_wheels}")
-                print(f"  L_total = {L_total}")
 
             # Save position and velocity
             if k == N_mc - 1:
@@ -477,6 +460,11 @@ for k in range(N_mc):
 
         t += dt
         step += 1
+
+    if error > 10:  # If failed to converge
+                print(f"  Initial q[0] sign: {q_initial[0]:.3f}")
+                print(f"  Final quaternion: {y[0:4]}")
+                print(f"  Final wheel speeds: {y[7:10] * 60/(2*np.pi)} RPM")
 
     final_error_mc.append(error)
     max_error_mc.append(max_error)
